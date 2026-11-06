@@ -1,0 +1,372 @@
+# 코랩 환경 필수 라이브러리 설치
+!pip install schedule yfinance pytz pandas numpy
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import schedule
+import time
+import requests
+import pytz
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# 텔레그램 봇 설정 (토큰 및 챗 ID 반영)
+TELEGRAM_TOKEN = "8800837409:AAFt-5vv7kZTcWi6Tge0wZJKe6U1IKC-6m8"
+CHAT_ID = "6014696807"
+
+# 1. 테마 & 유니버스 설정 (미국 주요 섹터)
+SECTOR_ETFS = {
+    "반도체/AI": "SOXX",
+    "빅테크/IT": "XLK",
+    "임의소비재/전기차": "XLY",
+    "통신/미디어": "XLC",
+    "금융": "XLF",
+    "산업재/우주방산": "XLI",
+    "에너지/원자력": "XLE",
+    "바이오/헬스케어": "XLV"
+}
+
+THEME_UNIVERSE = {
+    "반도체/AI": ["NVDA", "AMD", "AVGO", "TSM", "MU", "ARM", "SMCI", "ASML", "LRCX", "AMAT"],
+    "빅테크/IT": ["AAPL", "MSFT", "GOOGL", "META", "ORCL", "PLTR", "PANW", "CRWD", "NOW"],
+    "임의소비재/전기차": ["TSLA", "AMZN", "HD", "JOBY", "RIVN", "LCID", "NKE", "MCD", "SBUX"],
+    "통신/미디어": ["NFLX", "DIS", "TMUS", "SPOT", "CMCSA"],
+    "금융": ["JPM", "BAC", "GS", "MS", "V", "MA", "AXP", "BLK"],
+    "산업재/우주방산": ["GE", "CAT", "LMT", "NOC", "RTX", "BA", "HON", "DE"],
+    "에너지/원자력": ["XOM", "CVX", "CEG", "OKLO", "VST", "SMR", "COP", "SLB"],
+    "바이오/헬스케어": ["LLY", "NVO", "PFE", "UNH", "ABBV", "JNJ", "MRK", "AMGN"]
+}
+
+# 🇰🇷 한국 시장 광범위 스크리닝 풀 (1줄 1항목 안전 분리)
+KR_EXPANDED_POOL = [
+    ("삼성전자", "005930.KS"),
+    ("SK하이닉스", "000660.KS"),
+    ("LG에너지솔루션", "373220.KS"),
+    ("삼성바이오로직스", "207940.KS"),
+    ("현대차", "005380.KS"),
+    ("기아", "000270.KS"),
+    ("셀트리온", "068270.KS"),
+    ("KB금융", "105560.KS"),
+    ("신한지주", "055550.KS"),
+    ("POSCO홀딩스", "005490.KS"),
+    ("NAVER", "035420.KS"),
+    ("카카오", "035720.KS"),
+    ("삼성SDI", "006400.KS"),
+    ("현대모비스", "012330.KS"),
+    ("삼성물산", "028260.KS"),
+    ("하나금융지주", "086790.KS"),
+    ("LG화학", "051910.KS"),
+    ("한화에어로스페이스", "012450.KS"),
+    ("현대로템", "064350.KS"),
+    ("HD현대일렉트릭", "267260.KS"),
+    ("삼양식품", "003230.KS"),
+    ("에코프로비엠", "247540.KQ"),
+    ("에코프로", "086520.KQ"),
+    ("알테오젠", "196170.KQ"),
+    ("HLB", "028300.KQ"),
+    ("삼천당제약", "000250.KQ"),
+    ("리가켐바이오", "141080.KQ"),
+    ("BGF리테일", "282330.KS"),
+    ("CJ CGV", "079160.KS"),
+    ("DB", "012030.KS"),
+    ("CJ제일제당", "097950.KS"),
+    ("DH오토넥스", "000300.KS"),
+    ("LS일렉트릭", "010120.KS"),
+    ("두산에너빌리티", "034020.KS"),
+    ("한미반도체", "042700.KS"),
+    ("크래프톤", "259960.KS")
+]
+
+# 🇺🇸 미국 시장 광범위 스크리닝 풀
+US_EXPANDED_POOL = [
+    "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "LLY", "JPM",
+    "UNH", "V", "XOM", "MA", "HD", "PG", "COST", "JNJ", "ABBV", "MRK",
+    "BAC", "CVX", "CRM", "NFLX", "AMD", "WMT", "PEP", "KO", "TSM", "ORCL",
+    "LMT", "GE", "CEG", "PLTR", "JOBY", "OKLO", "VST", "SMR", "ARM", "SMCI"
+]
+
+def send_telegram_message(text):
+    url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text}
+    try:
+        response = requests.post(url, data=payload, timeout=15)
+        res_json = response.json()
+        if not res_json.get("ok"):
+            print("❌ 텔레그램 발송 실패:", res_json.get("description"))
+            return False
+        print("✅ 텔레그램 메시지 전송 성공!")
+        return True
+    except Exception as e:
+        print("❌ 통신 오류:", e)
+        return False
+
+def get_hottest_theme():
+    theme_scores = {}
+    for theme_name, etf_symbol in SECTOR_ETFS.items():
+        try:
+            etf = yf.Ticker(etf_symbol)
+            df = etf.history(period="1mo")
+            if len(df) < 20:
+                continue
+            close_now = df["Close"].iloc[-1]
+            close_prev = df["Close"].iloc[-6]
+            ret_5d = ((close_now - close_prev) / close_prev) * 100
+            vol_now = df["Volume"].iloc[-1]
+            vol_avg = df["Volume"].rolling(20).mean().iloc[-1]
+            vol_ratio = vol_now / vol_avg if vol_avg > 0 else 1.0
+            score = (ret_5d * 0.7) + (vol_ratio * 3.0)
+            theme_scores[theme_name] = (score, ret_5d, vol_ratio)
+        except Exception:
+            continue
+    if not theme_scores:
+        return None, 0, 0
+    top_theme = max(theme_scores, key=lambda k: theme_scores[k][0])
+    _, top_ret, top_vol = theme_scores[top_theme]
+    return top_theme, top_ret, top_vol
+
+def analyze_theme_leader(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        df = stock.history(period="3mo")
+        if df.empty or len(df) < 50:
+            return None
+
+        df["Vol_20MA"] = df["Volume"].rolling(20).mean()
+        current_vol = df["Volume"].iloc[-1]
+        avg_vol = df["Vol_20MA"].iloc[-1]
+        vol_ratio = current_vol / avg_vol if avg_vol > 0 else 0
+        vol_cond = vol_ratio >= 1.5
+
+        df["OBV"] = (np.sign(df["Close"].diff()) * df["Volume"]).fillna(0).cumsum()
+        obv_cond = df["OBV"].iloc[-1] > df["OBV"].rolling(20).mean().iloc[-1]
+
+        df["20MA"] = df["Close"].rolling(20).mean()
+        df["50MA"] = df["Close"].rolling(50).mean()
+        current_close = df["Close"].iloc[-1]
+        pattern_cond = (current_close > df["20MA"].iloc[-1]) and (df["20MA"].iloc[-1] > df["50MA"].iloc[-1])
+
+        if vol_cond and obv_cond and pattern_cond:
+            prev_close = df["Close"].iloc[-6]
+            price_change_5d = ((current_close - prev_close) / prev_close) * 100
+            score = vol_ratio * (1 + (price_change_5d / 100))
+            return {
+                "ticker": ticker,
+                "price": current_close,
+                "vol_ratio": vol_ratio,
+                "change_5d": price_change_5d,
+                "score": score
+            }
+        return None
+    except Exception:
+        return None
+
+def analyze_kr_stock(name, symbol):
+    try:
+        stock = yf.Ticker(symbol)
+        df = stock.history(period="3mo")
+        if df.empty or len(df) < 20:
+            return None
+
+        close = df["Close"].iloc[-1]
+        prev_close = df["Close"].iloc[-6]
+        change_5d = ((close - prev_close) / prev_close) * 100
+        vol_20ma = df["Volume"].rolling(20).mean().iloc[-1]
+        vol_ratio = df["Volume"].iloc[-1] / vol_20ma if vol_20ma > 0 else 0.0
+        
+        ma20 = df["Close"].rolling(20).mean().iloc[-1]
+        ma50 = df["Close"].rolling(50).mean().iloc[-1] if len(df) >= 50 else ma20
+
+        if change_5d > 5.0 and close > ma20:
+            opinion = "매수 (강한 상승 추세)"
+        elif close > ma20 and ma20 >= ma50:
+            opinion = "매수 (완만한 상승 추세)"
+        else:
+            opinion = "중립 / 관망"
+
+        return {
+            "name": name,
+            "symbol": symbol,
+            "price": close,
+            "change": change_5d,
+            "vol_ratio": vol_ratio,
+            "opinion": opinion
+        }
+    except Exception:
+        return None
+
+def analyze_us_sp500(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        df = stock.history(period="3mo")
+        if df.empty or len(df) < 50:
+            return None
+
+        close = df["Close"].iloc[-1]
+        open_price = df["Open"].iloc[-1]
+        prev_high = df["High"].iloc[-2]
+        prev_low = df["Low"].iloc[-2]
+        volume = df["Volume"].iloc[-1]
+
+        prev_close = df["Close"].iloc[-6]
+        change_5d = ((close - prev_close) / prev_close) * 100
+        trading_val_million = (volume * close) / 1000000.0
+
+        target_breakout = open_price + (prev_high - prev_low) * 0.5
+        v_breakout = close > target_breakout
+
+        ma20 = df["Close"].rolling(20).mean()
+        std20 = df["Close"].rolling(20).std()
+        bb_upper = ma20.iloc[-1] + (2 * std20.iloc[-1])
+        bb_breakout = close > bb_upper
+
+        low_14 = df["Low"].rolling(14).min()
+        high_14 = df["High"].rolling(14).max()
+        fast_k = ((df["Close"] - low_14) / (high_14 - low_14)) * 100
+        slow_k = fast_k.rolling(3).mean().iloc[-1]
+        stoch_signal = slow_k > 80
+
+        if v_breakout or bb_breakout:
+            signal = "단기 슈팅 매수"
+        elif close > ma20.iloc[-1]:
+            signal = "상승 추세 유지"
+        else:
+            signal = "중립 / 관망"
+
+        return {
+            "ticker": ticker,
+            "price": close,
+            "signal": signal,
+            "change": change_5d,
+            "trading_val": trading_val_million,
+            "v_breakout": v_breakout,
+            "bb_breakout": bb_breakout,
+            "stoch_signal": stoch_signal
+        }
+    except Exception:
+        return None
+
+def job():
+    kst = pytz.timezone("Asia/Seoul")
+    now_kst = datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S")
+    start_time = datetime.now()
+
+    # 1. 주도 테마 섹션
+    top_theme, theme_ret, theme_vol = get_hottest_theme()
+    theme_lines = []
+    if top_theme:
+        candidates = THEME_UNIVERSE.get(top_theme, [])
+        theme_results = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(analyze_theme_leader, t): t for t in candidates}
+            for f in as_completed(futures):
+                res = f.result()
+                if res:
+                    theme_results.append(res)
+        
+        if theme_results:
+            theme_results.sort(key=lambda x: x["score"], reverse=True)
+            theme_lines.append("🔥 현재 자금 최다 유입 테마: [" + top_theme + "]")
+            str_theme_stat = "- 테마 최근 5일 수익률: " + f"{theme_ret:+.2f}" + "% / 거래 유입: " + f"{theme_vol:.1f}" + "배"
+            theme_lines.append(str_theme_stat)
+            for rank, item in enumerate(theme_results[:2], 1):
+                badge = "👑 [원톱 대장주]" if rank == 1 else "⭐ [후속주]"
+                item_str = badge + " " + item["ticker"] + " - 현재가: $" + f"{item['price']:.2f}" + " (5일: " + f"{item['change_5d']:+.1f}" + "%, 거래량: " + f"{item['vol_ratio']:.1f}" + "배)"
+                theme_lines.append(item_str)
+        else:
+            theme_lines.append("🔥 현재 자금 최다 유입 테마: [" + top_theme + "]")
+            theme_lines.append("- 테마 최근 5일 수익률: " + f"{theme_ret:+.2f}" + "%")
+            theme_lines.append("⚠️ 해당 테마 내 4대 조건 만족 대장주 후보 없음")
+    else:
+        theme_lines.append("⚠️ 테마 분석을 완료하지 못했습니다.")
+    
+    theme_section = "\n".join(theme_lines)
+
+    # 2. 한국 시장 모멘텀 TOP 5
+    kr_results = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(analyze_kr_stock, name, sym): name for name, sym in KR_EXPANDED_POOL}
+        for f in as_completed(futures):
+            res = f.result()
+            if res:
+                kr_results.append(res)
+    
+    kr_results.sort(key=lambda x: x["change"], reverse=True)
+    kr_top5 = kr_results[:5]
+    kr_blocks = []
+    for idx, item in enumerate(kr_top5, 1):
+        name = item["name"]
+        code_clean = item["symbol"].split(".")[0]
+        price = item["price"]
+        change = item["change"]
+        vol_ratio = item["vol_ratio"]
+        opinion = item["opinion"]
+        
+        line1 = f"{idx}. {name} ({code_clean}) - 현재가: {price:,.0f}원"
+        line2 = f"   상승폭: {change:+.2f}% / 거래량: {vol_ratio:.2f}배"
+        line3 = f"   의견: {opinion}"
+        kr_blocks.append(line1 + "\n" + line2 + "\n" + line3)
+    
+    kr_section = "\n\n".join(kr_blocks)
+
+    # 3. 미국 시장 모멘텀 TOP 5
+    us_results = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(analyze_us_sp500, t): t for t in US_EXPANDED_POOL}
+        for f in as_completed(futures):
+            res = f.result()
+            if res:
+                us_results.append(res)
+
+    us_results.sort(key=lambda x: x["change"], reverse=True)
+    us_top5 = us_results[:5]
+    us_blocks = []
+    for idx, item in enumerate(us_top5, 1):
+        ticker = item["ticker"]
+        price = item["price"]
+        signal = item["signal"]
+        change = item["change"]
+        t_val = item["trading_val"]
+        v_b = item["v_breakout"]
+        bb_b = item["bb_breakout"]
+        stoch = item["stoch_signal"]
+        
+        line1 = f"{idx}. {ticker} - 현재가: ${price:.2f}"
+        line2 = f"   매매사인: {signal}"
+        line3 = f"   상승폭: {change:+.2f}% / 거래대금: ${t_val:,.1f}백만"
+        line4 = f"   변동성돌파: {v_b} / BB돌파: {bb_b} / 스토캐스틱: {stoch}"
+        us_blocks.append(line1 + "\n" + line2 + "\n" + line3 + "\n" + line4)
+        
+    us_section = "\n\n".join(us_blocks)
+
+    # 전체 메시지 조합
+    final_msg_lines = [
+        "📊 [국내·미국 종합 주도주 & 테마 리포트 - " + now_kst + "]",
+        "",
+        "🎯 [주도 테마 & 대장주 발굴]",
+        theme_section,
+        "",
+        "-----------------------------------",
+        "🇰🇷 [한국 시장 모멘텀 TOP 5 (광범위 스크리닝)]",
+        "",
+        kr_section,
+        "",
+        "-----------------------------------",
+        "🇺🇸 [미국 시장 모멘텀 TOP 5 & 4대지표 분석 (광범위 스크리닝)]",
+        "",
+        us_section
+    ]
+    
+    final_msg = "\n".join(final_msg_lines)
+    send_telegram_message(final_msg)
+    print("통합 분석 완료 (" + now_kst + "). 소요 시간:", datetime.now() - start_time)
+
+schedule.every().day.at("12:00").do(job)
+
+print("시스템 설정 완료. 파싱 안심 구조로 알고리즘을 즉시 실행합니다...")
+job()
+
+print("\n한국 시간(KST) 밤 9시 스케줄러 대기 중...")
+while True:
+    schedule.run_pending()
+    time.sleep(60)
